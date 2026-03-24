@@ -1,0 +1,39 @@
+# TC-DRO: Full experiment config for CPU VM (16 cores, 128GB RAM)
+# Estimated time: ~2 hours for all 8 datasets × 5 methods × 3 seeds
+
+dataset:
+  name: abalone
+  path: data/
+  test_ratio: 0.2
+  val_ratio: 0.1
+  random_seed: 42
+
+dro:
+  ambiguity_type: tc-chi2
+  radius_base: 0.1
+  density_exponent: 0.5
+  num_bins: 50
+
+model:
+  architecture: mlp
+  hidden_dims: [64, 32]
+  dropout: 0.1
+  activation: relu
+
+training:
+  epochs: 100
+  batch_size: 64
+  lr: 1.0e-3
+  weight_decay: 1.0e-5
+  optimizer: adam
+  patience: 15
+
+evaluation:
+  metrics:
+    - mse
+    - mae
+    - sera
+    - tail_mse
+    - tail_mae
+    - coverage_at_quantile
+  rare_threshold_percentiles: [5, 10, 25]
