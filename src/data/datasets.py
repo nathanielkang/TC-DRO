@@ -1,4 +1,8 @@
-"""Data loading and preprocessing for imbalanced regression benchmarks."""
+"""Data loading and preprocessing for imbalanced regression benchmarks.
+
+All seven datasets are real benchmarks from OpenML / UCI.
+No synthetic data generation for the listed OpenML benchmarks (real data only).
+"""
 
 from __future__ import annotations
 
@@ -11,39 +15,14 @@ from sklearn.model_selection import train_test_split
 
 OPENML_DATASETS: dict[str, dict[str, Any]] = {
     "abalone": {"id": 183, "target": "Rings"},
+    "ailerons": {"id": 296, "target": None},
+    "accel": {"id": 1199, "target": None},
     "bank8FM": {"id": 558, "target": None},
     "cpu_act": {"id": 573, "target": "usr"},
+    "delta_ailerons": {"id": 803, "target": None},
     "machine_cpu": {"id": 230, "target": None},
     "airfoil": {"id": 1503, "target": None},
 }
-
-SYNTHETIC_DATASETS: dict[str, dict[str, int]] = {
-    "ailerons": {"n_samples": 7154, "n_features": 40},
-    "accel": {"n_samples": 1732, "n_features": 14},
-    "delta_ailerons": {"n_samples": 7129, "n_features": 5},
-}
-
-
-def _generate_synthetic_imbalanced(
-    n_samples: int,
-    n_features: int,
-    noise_std: float = 0.5,
-    seed: int = 42,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Generate synthetic regression data with skewed (imbalanced) targets."""
-    from sklearn.datasets import make_regression
-
-    X, y = make_regression(
-        n_samples=n_samples,
-        n_features=n_features,
-        n_informative=max(n_features // 2, 1),
-        noise=noise_std,
-        random_state=seed,
-    )
-    rng = np.random.default_rng(seed)
-    skew_noise = rng.exponential(scale=2.0, size=n_samples)
-    y = y + skew_noise * np.abs(y.max() - y.min()) * 0.1
-    return X.astype(np.float32), y.astype(np.float32)
 
 
 def _stratified_split(
@@ -54,15 +33,13 @@ def _stratified_split(
     seed: int,
     n_bins: int = 10,
 ) -> dict[str, np.ndarray]:
-    """Split data with stratified binning on y."""
+    """Split data with stratified binning on y (70/15/15 default)."""
     y_binned = np.digitize(
-        y, bins=np.linspace(y.min() - 1e-8, y.max() + 1e-8, n_bins + 1)
+        y, bins=np.linspace(y.min() - 1e-8, y.max() + 1e-8, n_bins + 1),
     )
     unique, counts = np.unique(y_binned, return_counts=True)
-    min_count = counts.min()
-    if min_count < 2:
-        for u in unique[counts < 2]:
-            y_binned[y_binned == u] = unique[counts.argmax()]
+    for u in unique[counts < 2]:
+        y_binned[y_binned == u] = unique[counts.argmax()]
 
     X_trainval, X_test, y_trainval, y_test = train_test_split(
         X, y, test_size=test_ratio, random_state=seed, stratify=y_binned,
@@ -92,100 +69,72 @@ def _stratified_split(
 
 
 class ImbalancedRegressionDataset:
-    """
-    Loads standard imbalanced regression benchmarks.
+    """Loads real imbalanced regression benchmarks from OpenML.
 
-    Supported datasets: abalone, ailerons, accel, bank8FM, cpu_act,
+    Supported: abalone, ailerons, accel, bank8FM, cpu_act,
     delta_ailerons, machine_cpu, airfoil.
-
-    Returns (X, y) as numpy arrays with train/val/test splits.
     """
 
     def __init__(
         self,
         name: str,
         path: str = "data/",
-        test_ratio: float = 0.2,
-        val_ratio: float = 0.1,
+        test_ratio: float = 0.15,
+        val_ratio: float = 0.15,
         random_seed: int = 42,
     ) -> None:
-        """
-        Initialize dataset loader.
-
-        Args:
-            name: Dataset name (abalone, ailerons, accel, etc.).
-            path: Base path for data files.
-            test_ratio: Fraction of data for test set.
-            val_ratio: Fraction of data for validation set.
-            random_seed: Random seed for reproducibility.
-        """
         self.name = name
         self.path = path
         self.test_ratio = test_ratio
         self.val_ratio = val_ratio
         self.random_seed = random_seed
 
-    def _load_openml(self, dataset_id: int, target_col: str | None) -> tuple[np.ndarray, np.ndarray]:
-        """Attempt to load from OpenML, fall back to synthetic."""
-        try:
-            from sklearn.datasets import fetch_openml
+    def _load_openml(
+        self, dataset_id: int, target_col: str | None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Load from OpenML by data_id."""
+        from sklearn.datasets import fetch_openml
 
-            data = fetch_openml(data_id=dataset_id, as_frame=True, parser="auto")
-            df = data.data
-            if target_col and target_col in df.columns:
-                y = df[target_col].values.astype(np.float32)
-                X = df.drop(columns=[target_col]).values.astype(np.float32)
-            elif data.target is not None:
-                y = np.asarray(data.target, dtype=np.float32)
-                X = df.values.astype(np.float32)
-            else:
-                y = df.iloc[:, -1].values.astype(np.float32)
-                X = df.iloc[:, :-1].values.astype(np.float32)
+        data = fetch_openml(data_id=dataset_id, as_frame=True, parser="auto")
+        df = data.data
+        if target_col and target_col in df.columns:
+            y = df[target_col].values
+            X = df.drop(columns=[target_col]).values
+        elif data.target is not None:
+            y = np.asarray(data.target)
+            X = df.values
+        else:
+            y = df.iloc[:, -1].values
+            X = df.iloc[:, :-1].values
 
-            non_numeric = []
-            for col_idx in range(X.shape[1]):
-                try:
-                    X[:, col_idx].astype(np.float32)
-                except (ValueError, TypeError):
-                    non_numeric.append(col_idx)
-            if non_numeric:
-                X = np.delete(X, non_numeric, axis=1)
+        import pandas as pd
 
-            nan_mask = np.isnan(X).any(axis=1) | np.isnan(y)
-            X, y = X[~nan_mask], y[~nan_mask]
-            return X.astype(np.float32), y.astype(np.float32)
+        y = pd.to_numeric(y, errors="coerce")
+        y = np.asarray(y, dtype=np.float32)
 
-        except Exception:
-            n_feat = max(5, dataset_id % 20 + 5)
-            return _generate_synthetic_imbalanced(
-                n_samples=2000, n_features=n_feat, seed=self.random_seed,
-            )
+        X_out = np.zeros((X.shape[0], X.shape[1]), dtype=np.float32)
+        for col_idx in range(X.shape[1]):
+            col = pd.to_numeric(X[:, col_idx], errors="coerce")
+            X_out[:, col_idx] = np.asarray(col, dtype=np.float32)
+
+        nan_mask = np.isnan(X_out).any(axis=1) | np.isnan(y)
+        X_out, y = X_out[~nan_mask], y[~nan_mask]
+        return X_out.astype(np.float32), y.astype(np.float32)
 
     def load(self) -> dict[str, Any]:
-        """
-        Load dataset and return splits.
-
-        Returns:
-            Dict with keys 'X_train', 'y_train', 'X_val', 'y_val',
-            'X_test', 'y_test', and 'relevance' for SERA.
-        """
-        if self.name in OPENML_DATASETS:
-            info = OPENML_DATASETS[self.name]
-            X, y = self._load_openml(info["id"], info.get("target"))
-        elif self.name in SYNTHETIC_DATASETS:
-            info = SYNTHETIC_DATASETS[self.name]
-            X, y = _generate_synthetic_imbalanced(
-                n_samples=info["n_samples"],
-                n_features=info["n_features"],
-                seed=self.random_seed,
-            )
-        else:
-            warnings.warn(f"Unknown dataset '{self.name}', generating synthetic data.")
-            X, y = _generate_synthetic_imbalanced(
-                n_samples=2000, n_features=10, seed=self.random_seed,
+        """Load dataset and return splits."""
+        if self.name not in OPENML_DATASETS:
+            raise ValueError(
+                f"Unknown dataset '{self.name}'. "
+                f"Available: {list(OPENML_DATASETS.keys())}"
             )
 
-        splits = _stratified_split(X, y, self.test_ratio, self.val_ratio, self.random_seed)
+        info = OPENML_DATASETS[self.name]
+        X, y = self._load_openml(info["id"], info.get("target"))
+
+        splits = _stratified_split(
+            X, y, self.test_ratio, self.val_ratio, self.random_seed,
+        )
 
         from sklearn.preprocessing import StandardScaler
 
@@ -205,19 +154,7 @@ class ImbalancedRegressionDataset:
 
 
 def get_relevance_function(y: np.ndarray) -> np.ndarray:
-    """
-    Compute SERA-style relevance scores for target values.
-
-    Uses box-plot fences: values beyond Q1 - 1.5*IQR or Q3 + 1.5*IQR
-    get relevance 1.0, values at the median get 0.0, with sigmoid
-    interpolation between.
-
-    Args:
-        y: Target values (1D array).
-
-    Returns:
-        Relevance scores per sample in [0, 1], same shape as y.
-    """
+    """SERA-style relevance scores using box-plot fences."""
     y = np.asarray(y, dtype=np.float64).ravel()
     q1 = np.percentile(y, 25)
     q3 = np.percentile(y, 75)
@@ -244,24 +181,11 @@ def get_relevance_function(y: np.ndarray) -> np.ndarray:
     return relevance.astype(np.float64)
 
 
-def estimate_target_density(y: np.ndarray, num_bins: int = 50) -> np.ndarray:
-    """
-    Estimate local sample density in target space via KDE.
-
-    Args:
-        y: Target values (1D array).
-        num_bins: Unused (kept for API compat); KDE uses automatic bandwidth.
-
-    Returns:
-        Density estimates per sample, same shape as y.
-    """
+def estimate_target_density(y: np.ndarray, num_bins: int = 10) -> np.ndarray:
+    """KDE density estimate at each sample location."""
     y = np.asarray(y, dtype=np.float64).ravel()
-    if len(y) < 2:
+    if len(y) < 2 or np.std(y) < 1e-12:
         return np.ones_like(y)
-    if np.std(y) < 1e-12:
-        return np.ones_like(y)
-
     kde = stats.gaussian_kde(y, bw_method="scott")
     density = kde.evaluate(y)
-    density = np.clip(density, 1e-8, None)
-    return density
+    return np.clip(density, 1e-8, None)

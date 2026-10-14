@@ -1,32 +1,49 @@
-# TC-DRO: Full experiment config for CPU VM (16 cores, 128GB RAM)
-# Estimated time: ~2 hours for all 8 datasets × 5 methods × 3 seeds
+# TC-DRO: Full experiment config (CPU-friendly defaults)
+# Scale: datasets × methods × seeds (set via CLI)
 
 dataset:
   name: abalone
   path: data/
-  test_ratio: 0.2
-  val_ratio: 0.1
+  test_ratio: 0.15
+  val_ratio: 0.15
   random_seed: 42
 
 dro:
   ambiguity_type: tc-chi2
   radius_base: 0.1
   density_exponent: 0.5
-  num_bins: 50
+  num_bins: 10
+  weight_clip: 10.0
+  # Truncation bound M on the per-sample squared residual used by the dual
+  # and by the weighted backward pass (targets are standardized).
+  loss_clip: 9.0
 
 model:
   architecture: mlp
-  hidden_dims: [64, 32]
+  hidden_dims: [256, 256, 256, 256]
   dropout: 0.1
   activation: relu
 
 training:
-  epochs: 100
+  epochs: 200
   batch_size: 64
   lr: 1.0e-3
   weight_decay: 1.0e-5
   optimizer: adam
-  patience: 15
+  patience: 20
+
+baseline_grids:
+  lds_fds:
+    sigma: [1.0, 2.0, 4.0]
+    kernel_size: [3, 5, 7]
+    fds_feature_dim: 256
+    fds_bins: 100
+  dense_loss:
+    bandwidth: [silverman, scott]
+  conr:
+    temperature: [0.05, 0.07, 0.1]
+    conr_weight: [0.05, 0.1, 0.2]
+    threshold: [0.5, 1.0, 2.0]
 
 evaluation:
   metrics:

@@ -1,0 +1,40 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+htmlcov/
+
+# Packaging
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Local experiment outputs (do not ship in anonymous code zip)
+results/*
+!results/table_capsule.json
+outputs/
+wandb/
+*.log
+.env
+.env.*
+code_submission/
+anonymous_code.zip
+*.zip
+
+# Supplementary: PDF only on GitHub; TeX stays local
+supplement/*.tex
+supplement/*.bib
+supplement/*.sty
+supplement/*.cls
+supplement/*.aux
+supplement/*.bbl
+supplement/*.blg
+supplement/*.out
+supplement/*.synctex.gz

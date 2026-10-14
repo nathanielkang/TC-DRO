@@ -1,4 +1,4 @@
-"""TC-DRO training loop with adaptive sample reweighting."""
+"""TC-DRO training loop with per-bin dual variable reweighting."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from src.data.datasets import estimate_target_density, get_relevance_function
+from src.data.datasets import get_relevance_function
 from src.evaluation.metrics import (
     coverage_at_quantile,
     mae,
@@ -20,14 +20,21 @@ from src.evaluation.metrics import (
 )
 
 
+DEFAULT_LOSS_CLIP = 9.0
+
+
 class TCDROTrainer:
-    """
-    Trainer for Target-Conditional DRO.
+    """Trainer implementing Algorithm 1 of the TC-DRO paper.
 
-    Implements one epoch of TC-DRO training with dual variable reweighting,
-    full training loop with early stopping, and evaluation.
+    Per mini-batch: compute losses → per-bin dual solve → DRO-optimal
+    sample weights → weighted gradient step.
 
-    Handles both PyTorch nn.Module models and XGBoostWrapper.
+    The per-sample squared residual is truncated at a fixed bound M before
+    the dual solve and before the weighted backward pass, so the training
+    objective is a bounded loss.  Bounded losses are what the per-bin dual
+    and the deviation bounds of the paper assume; an unbounded squared
+    residual admits no such bound.  Evaluation metrics are computed on the
+    raw predictions and are never truncated.
     """
 
     def __init__(
@@ -36,23 +43,18 @@ class TCDROTrainer:
         ambiguity_set: Any,
         config: dict[str, Any],
     ) -> None:
-        """
-        Initialize trainer.
-
-        Args:
-            model: Base learner (MLP, XGBoost, or linear).
-            ambiguity_set: TargetConditionalAmbiguitySet instance.
-            config: Training config (lr, epochs, batch_size, etc.).
-        """
         self.model = model
         self.ambiguity_set = ambiguity_set
         self.config = config
 
         training_cfg = config.get("training", {})
-        self.epochs = training_cfg.get("epochs", 100)
+        self.epochs = training_cfg.get("epochs", 200)
         self.lr = training_cfg.get("lr", 1e-3)
         self.weight_decay = training_cfg.get("weight_decay", 1e-5)
-        self.patience = training_cfg.get("patience", 10)
+        self.patience = training_cfg.get("patience", 20)
+
+        dro_cfg = config.get("dro", {}) or {}
+        self.loss_clip = float(dro_cfg.get("loss_clip", DEFAULT_LOSS_CLIP))
 
         self.is_nn = isinstance(model, nn.Module)
 
@@ -68,27 +70,17 @@ class TCDROTrainer:
         self.best_state = None
         self.best_val_loss = float("inf")
         self.device = torch.device("cpu")
+        self.y_train: np.ndarray | None = None
 
         if self.is_nn:
             self.model.to(self.device)
 
-    def _get_density_for_y(self, y: np.ndarray) -> np.ndarray:
-        """Estimate target density for a y array."""
-        return estimate_target_density(y, num_bins=self.ambiguity_set.num_bins)
+    def set_y_train(self, y_train: np.ndarray) -> None:
+        """Store training targets for bin boundary computation."""
+        self.y_train = np.asarray(y_train, dtype=np.float64).ravel()
 
     def train_epoch(self, dataloader: Any) -> float:
-        """
-        Run one epoch of TC-DRO training.
-
-        For nn.Module: standard SGD with DRO-weighted loss.
-        For XGBoost: compute DRO weights from all data, fit once.
-
-        Args:
-            dataloader: Training data loader (yields X, y batches).
-
-        Returns:
-            Average loss for the epoch.
-        """
+        """One epoch of TC-DRO training (Algorithm 1)."""
         if not self.is_nn:
             return self._train_epoch_xgb(dataloader)
 
@@ -102,24 +94,46 @@ class TCDROTrainer:
             if y_batch.dim() == 1:
                 y_batch = y_batch.unsqueeze(1)
 
-            y_np = y_batch.detach().cpu().numpy().ravel()
-            density = self._get_density_for_y(y_np)
-            weights_np = self.ambiguity_set.compute_sample_weights(y_np, density)
-            weights = torch.tensor(weights_np, dtype=torch.float32, device=self.device)
-
             self.optimizer.zero_grad()
             preds = self.model(X_batch)
-            loss = self.compute_dro_loss(preds, y_batch, weights)
-            loss.backward()
+
+            if preds.dim() == 2 and preds.shape[1] == 1:
+                preds_flat = preds.squeeze(1)
+            else:
+                preds_flat = preds
+            targets_flat = y_batch.squeeze(1) if y_batch.dim() == 2 else y_batch
+
+            per_sample_loss = torch.clamp(
+                (preds_flat - targets_flat) ** 2, max=self.loss_clip,
+            )
+            loss_np = per_sample_loss.detach().cpu().numpy().ravel()
+            y_np = targets_flat.detach().cpu().numpy().ravel()
+
+            y_ref = self.y_train if self.y_train is not None else y_np
+            weights_np = self.ambiguity_set.compute_sample_weights(
+                loss_np, y_np, y_ref,
+            )
+            weights = torch.tensor(
+                weights_np, dtype=torch.float32, device=self.device,
+            )
+
+            weighted_loss = (per_sample_loss * weights).mean()
+            weighted_loss.backward()
             self.optimizer.step()
 
-            total_loss += loss.item()
+            total_loss += weighted_loss.item()
             n_batches += 1
 
         return total_loss / max(n_batches, 1)
 
     def _train_epoch_xgb(self, dataloader: Any) -> float:
-        """Train XGBoost: collect all data, compute weights, fit once."""
+        """Train XGBoost: collect all data, compute weights, fit once.
+
+        The dual weights use the same truncated squared residual as the
+        neural path.  The booster's internal objective remains the library
+        squared loss; only the reweighting is computed from the bounded
+        residual.
+        """
         all_X, all_y = [], []
         for X_batch, y_batch in dataloader:
             all_X.append(np.asarray(X_batch))
@@ -127,49 +141,18 @@ class TCDROTrainer:
         X = np.concatenate(all_X, axis=0)
         y = np.concatenate(all_y, axis=0)
 
-        density = self._get_density_for_y(y)
-        weights = self.ambiguity_set.compute_sample_weights(y, density)
+        preds = self.model.predict(X).ravel() if hasattr(self.model, "predict") else np.zeros_like(y)
+        losses = np.minimum((y - preds) ** 2, self.loss_clip)
+
+        y_ref = self.y_train if self.y_train is not None else y
+        weights = self.ambiguity_set.compute_sample_weights(losses, y, y_ref)
         self.model.fit(X, y, sample_weight=weights)
 
         preds = self.model.predict(X)
-        return float(np.mean((y - preds) ** 2))
-
-    def compute_dro_loss(
-        self,
-        predictions: torch.Tensor,
-        targets: torch.Tensor,
-        weights: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Compute weighted loss with DRO reweighting.
-
-        Args:
-            predictions: Model predictions (batch, 1).
-            targets: Ground truth targets (batch, 1).
-            weights: Sample weights from dual variable computation (batch,).
-
-        Returns:
-            Scalar loss tensor.
-        """
-        if predictions.dim() == 2 and predictions.shape[1] == 1:
-            predictions = predictions.squeeze(1)
-        if targets.dim() == 2 and targets.shape[1] == 1:
-            targets = targets.squeeze(1)
-        weights = weights.ravel() if hasattr(weights, "ravel") else weights.view(-1)
-
-        per_sample_loss = (predictions - targets) ** 2
-        return (per_sample_loss * weights).mean()
+        return float(np.mean(np.minimum((y - preds) ** 2, self.loss_clip)))
 
     def evaluate(self, dataloader: Any) -> dict[str, float]:
-        """
-        Compute metrics on validation/test set.
-
-        Args:
-            dataloader: Data loader for evaluation.
-
-        Returns:
-            Dict of metric name -> value.
-        """
+        """Compute metrics on validation/test set."""
         all_y_true, all_y_pred = [], []
 
         if self.is_nn:
@@ -191,6 +174,7 @@ class TCDROTrainer:
         y_pred = np.concatenate(all_y_pred)
         relevance = get_relevance_function(y_true)
 
+        y_train_std = float(np.std(self.y_train)) if self.y_train is not None else None
         results = {
             "mse": mse(y_true, y_pred),
             "mae": mae(y_true, y_pred),
@@ -199,8 +183,8 @@ class TCDROTrainer:
             "tail_mse_10": tail_mse(y_true, y_pred, 10),
             "tail_mae_5": tail_mae(y_true, y_pred, 5),
             "tail_mae_10": tail_mae(y_true, y_pred, 10),
-            "coverage_5": coverage_at_quantile(y_true, y_pred, 5),
-            "coverage_10": coverage_at_quantile(y_true, y_pred, 10),
+            "coverage_5": coverage_at_quantile(y_true, y_pred, 5, y_train_std),
+            "coverage_10": coverage_at_quantile(y_true, y_pred, 10, y_train_std),
         }
         return results
 
@@ -209,16 +193,7 @@ class TCDROTrainer:
         train_loader: Any,
         val_loader: Any,
     ) -> dict[str, Any]:
-        """
-        Full training loop with early stopping.
-
-        Args:
-            train_loader: Training data loader.
-            val_loader: Validation data loader.
-
-        Returns:
-            Dict with 'history', 'best_epoch', 'best_metrics'.
-        """
+        """Full training loop with early stopping."""
         if not self.is_nn:
             train_loss = self.train_epoch(train_loader)
             val_metrics = self.evaluate(val_loader)

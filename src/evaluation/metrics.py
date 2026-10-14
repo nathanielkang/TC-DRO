@@ -119,15 +119,18 @@ def coverage_at_quantile(
     y_true: np.ndarray,
     y_pred: np.ndarray,
     quantile: float,
+    y_train_std: float | None = None,
 ) -> float:
     """
     Coverage metric in rare regions: fraction of tail predictions within
-    0.5 * std(y_true) of the true value.
+    0.5 * sigma_y of the true value, where sigma_y is the training-set std.
 
     Args:
-        y_true: Ground truth targets.
+        y_true: Ground truth targets (test set).
         y_pred: Predicted values.
         quantile: Percentile for rare region definition (e.g., 10).
+        y_train_std: Standard deviation of training targets.  Falls back to
+            std(y_true) if not provided.
 
     Returns:
         Coverage scalar in [0, 1].
@@ -139,8 +142,7 @@ def coverage_at_quantile(
     mask = (y_true <= lo) | (y_true >= hi)
     if mask.sum() == 0:
         return 0.0
-    threshold = np.std(y_true) * 0.5
-    if threshold < 1e-12:
-        threshold = 1e-12
+    sigma = y_train_std if y_train_std is not None else float(np.std(y_true))
+    threshold = max(sigma * 0.5, 1e-12)
     abs_err = np.abs(y_true[mask] - y_pred[mask])
     return float(np.mean(abs_err < threshold))
